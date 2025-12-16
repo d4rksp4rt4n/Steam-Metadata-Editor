@@ -261,7 +261,7 @@ class MainWindow:
         self.steamReleaseEntry3.pack(side="right", padx=(10, 0))
         self.steamReleaseEntry2.pack(side="right", padx=10)
         self.steamReleaseEntry1.pack(side="right", padx=(0, 10))
-        self.launchMenuButton.pack(side="left")
+        self.launchMenuButton.pack(side="left", padx=(0, 10))
         self.revertAppButton.pack(side="left")
         self.saveButton.pack(side="right")
         # Frames
@@ -345,16 +345,18 @@ class MainWindow:
         for section in sections:
             try:
                 data = data[section]
+            # specific fix: added TypeError to the caught exceptions
             except (KeyError, TypeError):
                 return error
         return data
     # Given a var, it removes the callback, sets the value
     # and reassigns the callback
     def set_var_no_callback(self, var, value, callback):
-        tracers = var.trace_info()
-        for mode, cbname in tracers:
-            if mode == "write":
-                var.trace_remove("write", cbname)
+        try:
+            callbackId = var.trace_vinfo()[0][1]
+            var.trace_remove("write", callbackId)
+        except IndexError:
+            pass
         var.set(value)
         var.trace_add("write", callback)
     def set_data_from_section(self, appID, value, *sections):
@@ -363,14 +365,28 @@ class MainWindow:
             self.save_original_data(appID)
             self.modifiedApps.append(appID)
         data = self.appinfo.parsedAppInfo[appID]["sections"]["appinfo"]
+       
         # Access all but the last element
-        for section in sections[0:len(sections) - 1]:
+        for section in sections[:-1]:
             try:
+                # Check if the value exists and is a valid dictionary
+                # If it is a string (broken data), we treat it as missing so we can overwrite it
+                if section in data and not isinstance(data[section], dict):
+                    data[section] = {}
+               
                 data = data[section]
-            except KeyError:
-                data[section] = {}
-                data = data[section]
-        data[sections[-1]] = value
+            except (KeyError, TypeError):
+                # If the key is missing or parent is not a dict, create a new folder
+                if isinstance(data, dict):
+                    data[section] = {}
+                    data = data[section]
+                else:
+                    # If we are here, the parent 'data' itself is likely a string
+                    # We cannot proceed safely, so we abort this specific save operation
+                    return
+        # Final safety check: ensure we are writing to a dictionary
+        if isinstance(data, dict):
+            data[sections[-1]] = value
     def get_unix_time(self, year, month, day):
         return int(datetime(year, month, day).timestamp())
     def set_timestamps(self, stampId):
@@ -447,13 +463,14 @@ class MainWindow:
     def fetch_app_data(self, _event):
         # Data from list
         currentItem = self.appList.focus()
+       
+        # CRITICAL FIX: Return immediately if no item is selected/focused
         if not currentItem:
             return
+           
         currentItemData = self.appList.item(currentItem)
-        values = currentItemData.get("values", "")
-        if not isinstance(values, (list, tuple)) or not values:
-            return
-        appID = values[-1]
+        appID = currentItemData["values"][-1]
+       
         # Fetched data
         appName = self.get_data_from_section(appID, "common", "name")
         appSortAs = self.get_data_from_section(appID, "common", "sortas")
@@ -602,10 +619,11 @@ class MainWindow:
         if answer:
             self.add_launch_option(appID)
             self.launchMenuWindow.deiconify()
-            return False  # Window not destroyed
         else:
+            self.launchMenuWindow.unbind_all("<MouseWheel>")
+            self.launchMenuWindow.unbind_all("<Button-4>")
+            self.launchMenuWindow.unbind_all("<Button-5>")
             self.launchMenuWindow.destroy()
-            return True  # Window destroyed
     def move_launch_option(self, appID, optionNumber, direction):
         launchOption = self.get_data_from_section(
             appID, "config", "launch", optionNumber
@@ -702,12 +720,19 @@ class MainWindow:
         if parentFolders is not None:
             return "../" * parentFolders + "/".join(execDir[index:])
         elif execDir[index:] == steamDir[index]:
-            return ""
+            return "." # Changed from "" to "."
         else:
             return "/".join(execDir[index + 1:])
     def generate_launch_option_string(
-        self, appID, execVar, wkngDirVar, pathType
+        self, appID, launchOption, execVar, wkngDirVar, pathType
     ):
+        """
+        Handles the browse button functionality for executable and working directory.
+       
+        Note: This function now includes an explicit call to set_data_from_section
+        when setting the working directory (wkngDir) to ensure the save trace fires.
+        It also replaces an empty path (relative to the install dir) with "." for clarity.
+        """
         install_path = self.appinfo.parsedAppInfo[appID]["install_path"]
         if pathType == "exe":
             exePath = filedialog.askopenfilename(
@@ -722,6 +747,10 @@ class MainWindow:
             if config.CURRENT_OS == "Windows":
                 exePath = exePath.replace("/", "\\")
                 wkngDirPath = wkngDirPath.replace("/", "\\")
+           
+            # FIX: If path is empty (meaning the install folder), set to "." for visibility
+            if not wkngDirPath:
+                wkngDirPath = "."
             execVar.set(exePath)
             wkngDirVar.set(wkngDirPath)
         elif pathType == "wkngDir":
@@ -735,7 +764,22 @@ class MainWindow:
             )
             if config.CURRENT_OS == "Windows":
                 wkngDirPath = wkngDirPath.replace("/", "\\")
+           
+            # FIX: If path is empty (meaning the install folder), set to "." for visibility
+            if not wkngDirPath:
+                wkngDirPath = "."
+               
             wkngDirVar.set(wkngDirPath)
+            # **CRITICAL FIX:** Explicitly call the save function here.
+            # The Entry widget's trace does not fire when set programmatically.
+            self.set_data_from_section(
+                appID,
+                wkngDirVar.get(),
+                "config",
+                "launch",
+                launchOption,
+                "workingdir",
+            )
     def write_os_list(self, appID, winVar, macVar, linVar, launchOption):
         oslist = []
         if winVar.get():
@@ -799,8 +843,8 @@ class MainWindow:
             execFrame,
             text="...",
             command=lambda: self.generate_launch_option_string(
-                appID, execVar, wkngDirVar, "exe"
-            ),
+            appID, number, execVar, wkngDirVar, "exe"
+        ),
         )
         wkngDirLabel = Label(wkngDirFrame, text="Working Directory:")
         wkngDirEntry = Entry(
@@ -813,8 +857,8 @@ class MainWindow:
             wkngDirFrame,
             text="...",
             command=lambda: self.generate_launch_option_string(
-                appID, execVar, wkngDirVar, "wkngDir"
-            ),
+            appID, number, execVar, wkngDirVar, "wkngDir"
+        ),
         )
         argLabel = Label(argFrame, text="Launch Arguments:")
         argEntry = Entry(
@@ -955,7 +999,8 @@ class MainWindow:
             appID, "config", "launch"
         )
         if not appLaunchOptions:
-            return True  # Signal no options, prompt needed
+            self.ask_to_create_launch_option(appID)
+            return
         frameCount = 0
         for launchOption in appLaunchOptions.keys():
             description = self.get_data_from_section(
@@ -1011,28 +1056,79 @@ class MainWindow:
         # Resizes window depending on the number of launch options
         self.scrollFrame.canvas.config(width=geometry[0], height=geometry[1])
         self.scrollFrame.canvas.yview_moveto(scrollbarPosition)
-        return False  # Options exist, no prompt needed
     def create_launch_menu_window(self):
+        # --- FIX 1: Handle case where no app is selected ---
         appName = self.nameVar.get()
-        appID = int(self.idVar.get())
+        appID_str = self.idVar.get()
+       
+        if not appID_str:
+            messagebox.showerror(
+                title="No App Selected",
+                message="Please select an application from the list first."
+            )
+            return
+        try:
+            appID = int(appID_str)
+        except ValueError:
+            messagebox.showerror(
+                title="Error",
+                message="Invalid App ID. Please select a valid application."
+            )
+            return
+        # -----------------------------------------------------
         self.launchMenuWindow = tk.Toplevel(self.window)
+        # --- Safe Close Protocol ---
+        # FIX 2: Added logic to safely close the window when the prompt is cancelled (i.e., 'No' is selected)
+        # We need this to ensure the window is unbound and destroyed *before* the outer code resumes.
+        def on_launch_window_close():
+            # 1. Unbind mouse events so pending scroll events don't fire on dead widgets
+            self.launchMenuWindow.unbind_all("<MouseWheel>")
+            self.launchMenuWindow.unbind_all("<Button-4>")
+            self.launchMenuWindow.unbind_all("<Button-5>")
+           
+            # 2. Check if the window is still running its mainloop. If so, quit it.
+            # This is crucial for handling the "No" click in ask_to_create_launch_option
+            try:
+                self.launchMenuWindow.quit()
+            except tk.TclError:
+                # The window might already be destroyed or closing, which is fine.
+                pass
+           
+            # 3. Explicitly destroy the window here to ensure all references are cleaned up immediately.
+            try:
+                self.launchMenuWindow.destroy()
+            except tk.TclError:
+                pass
+        # Override the window's close button (the 'X' on the title bar)
+        self.launchMenuWindow.protocol("WM_DELETE_WINDOW", on_launch_window_close)
         self.launchMenuWindow.resizable(False, False)
         self.launchMenuWindow.title(
             f"Launch Menu Editor for {appName} ({appID})"
         )
         self.scrollFrame = ScrollableFrame(self.launchMenuWindow)
         self.scrollFrame.scrollableFrame.config(bg=config.BG, padx=20, pady=20)
-        no_options = self.update_launch_menu_window(appID)
-        if no_options:
-            destroyed = self.ask_to_create_launch_option(appID)
-            if destroyed:
-                return  # Skip packing if window destroyed
+        # Call the update function, which might show the "No Launch Options" prompt.
+        self.update_launch_menu_window(appID)
+        # --- FIX 2: Check if the window was destroyed by the 'No' response in update_launch_menu_window ---
+        # If the user clicked "No" to the prompt, the window was destroyed inside ask_to_create_launch_option.
+        # We must return now to prevent trying to pack a destroyed widget.
+        if not self.launchMenuWindow.winfo_exists():
+            return
+        # -------------------------------------------------------------------------------------------------
         self.scrollFrame.pack()
         self.launchMenuWindow.update()
         self.center_window(self.launchMenuWindow)
         # Prevent the use of the main window while this one exists
         self.launchMenuWindow.grab_set()
+       
+        # Start nested loop
         self.launchMenuWindow.mainloop()
+        # The window is destroyed inside on_launch_window_close now.
+        # This line is technically unreachable if mainloop is active, but we can keep it as a fallback.
+        try:
+            self.launchMenuWindow.destroy()
+        except tk.TclError:
+            pass
     def populate_app_list(self):
         # Get all applications found in appinfo.vdf
         keys = list(self.appinfo.parsedAppInfo.keys())
